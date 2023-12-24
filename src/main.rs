@@ -1,7 +1,7 @@
-use std::collections::HashSet;
 use reqwest::Response;
-use tokio::sync::mpsc::Sender;
-use swc::PipeInput;
+use std::collections::HashSet;
+use swc::Pipeline;
+use tokio::join;
 
 ///
 /// Web Crawler
@@ -40,24 +40,50 @@ use swc::PipeInput;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let query = "Google";
+    // let query = "Google";
     let init_urls = vec![
         "https://google.com/".to_string(),
         "https://maps.google.com".to_string(),
     ];
-    
+
     let mut visited = HashSet::new();
-    
-    let fetch = async move |url: String, crawl_input: &PipeInput<Response>| {
+    let fetch = |url: String| async {
         if visited.contains(&url) {
-            return
+            return None;
         }
-        
+
         visited.insert(url.clone());
-        let resp = reqwest::get(&url).await.unwrap();
-        crawl_input.submit(resp).await;
+        Some(reqwest::get(&url).await.unwrap())
     };
 
-    swc::crawl_the_web(query, init_urls).await;
+    let mut pipeline = Pipeline::new();
+
+    let (url_out, url_in) = pipeline.create_pipe();
+    let (resp_out, resp_in) = pipeline.create_pipe();
+    let (content_out, content_in) = pipeline.create_pipe();
+
+    let producer = async move {
+        url_out.submit_all(init_urls).await;
+    };
+    pipeline.register_worker(url_in, Some(resp_out), fetch);
+    pipeline.register_worker(resp_in, Some(content_out), crawl);
+    pipeline.register_worker(content_in, None, format);
+
+    join!(producer, pipeline.run());
     Ok(())
+}
+
+struct Fetcher {
+    visited: Vec<String>,
+}
+
+async fn crawl(response: Response) -> Option<String> {
+    let content = response.text().await.unwrap();
+    println!("Response size: {}", content.len());
+    Some(content)
+}
+
+async fn format(_content: String) -> Option<()> {
+    println!("Received content");
+    None
 }
