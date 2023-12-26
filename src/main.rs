@@ -1,12 +1,12 @@
-use reqwest::dns::Resolve;
-use reqwest::Response;
 use std::collections::HashSet;
-use std::future::Future;
 use std::sync::{Arc, Mutex};
-use swc::{PipeInput, PipeOutput, Pipeline};
+
+use reqwest::Response;
 use tokio::join;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+use swc::{PipeInput, PipeOutput, Pipeline};
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let query = "Google";
     let init_urls: Vec<String> = vec![
@@ -25,47 +25,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pipeline = Pipeline::new();
 
-    let (url_out, url_in) = pipeline.create_pipe();
-    let (resp_out, resp_in) = pipeline.create_pipe();
-    let (content_out, content_in) = pipeline.create_pipe();
+    let (url_out, url_in) = pipeline.create_pipe("urls");
+    let (resp_out, resp_in) = pipeline.create_pipe("responses");
+    let (content_out, content_in) = pipeline.create_pipe("content");
 
+    let init_url_out = url_out.clone();
     let producer = async move {
         for url in init_urls {
-            url_out.submit(url).await;
+            init_url_out.submit(url).await;
         }
     };
     register_fetch(&mut pipeline, url_in, resp_out);
-    register_crawl(&mut pipeline, resp_in, content_out);
+    register_crawl(&mut pipeline, resp_in, url_out, content_out);
     register_format(&mut pipeline, content_in);
 
-    join!(producer, pipeline.run());
+    join!(producer, pipeline.wait());
     Ok(())
 }
 
 fn register_fetch(pipeline: &mut Pipeline, input: PipeInput<String>, output: PipeOutput<Response>) {
     let visited = Arc::new(Mutex::new(HashSet::new()));
 
-    pipeline.register_worker(input, Some(output), |url: String| async move {
+    pipeline.register_worker("fetch", input, vec![output], |url: String| async move {
         if visited.lock().unwrap().contains(&url) {
-            return None;
+            return vec![None];
         }
 
         visited.lock().unwrap().insert(url.clone());
-        reqwest::get(&url).await.map(Some).unwrap_or(None)
+        vec![reqwest::get(&url).await.map(Some).unwrap_or(None)]
     });
 }
 
-fn register_crawl(pipeline: &mut Pipeline, input: PipeInput<Response>, output: PipeOutput<String>) {
-    pipeline.register_worker(input, Some(output), |response: Response| async move {
+fn register_crawl(
+    pipeline: &mut Pipeline,
+    input: PipeInput<Response>,
+    url_output: PipeOutput<String>,
+    content_output: PipeOutput<String>,
+) {
+    let outputs = vec![url_output, content_output];
+    pipeline.register_worker("crawl", input, outputs, |response: Response| async move {
         let content = response.text().await.unwrap();
         println!("Response size: {}", content.len());
-        Some(content)
+        vec![None, Some(content)]
     });
 }
 
 fn register_format(pipeline: &mut Pipeline, input: PipeInput<String>) {
-    pipeline.register_worker(input, None, |_content: String| async move {
+    pipeline.register_worker("format", input, vec![], |_content: String| async move {
         println!("Received content");
-        Option::<String>::None
+        vec![Option::<String>::None]
     });
 }
