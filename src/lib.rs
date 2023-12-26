@@ -1,3 +1,5 @@
+mod thread_testing;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -7,7 +9,6 @@ use tokio::task::JoinSet;
 
 #[derive(Debug, Default)]
 pub struct Pipeline {
-    synchronizer: Arc<Mutex<Synchronizer>>,
     workers: JoinSet<()>,
 }
 
@@ -19,11 +20,7 @@ impl Pipeline {
     pub fn create_pipe<T>(&self) -> (PipeOutput<T>, PipeInput<T>) {
         let (tx, rx) = channel(100);
         let id = uuid::Uuid::new_v4().to_string();
-        self.synchronizer.lock().unwrap().add_pipe(&id);
-        (
-            PipeOutput::new(&id, self.synchronizer.clone(), tx),
-            PipeInput::new(&id, self.synchronizer.clone(), rx),
-        )
+        (PipeOutput::new(&id, tx), PipeInput::new(&id, rx))
     }
 
     pub async fn run(&mut self) {
@@ -41,42 +38,34 @@ impl Pipeline {
     ) where
         I: Send + 'static,
         O: Send + 'static,
-        F: FnMut(I) -> Fut + Clone + Send + 'static,
+        F: FnOnce(I) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Option<O>> + Send + 'static,
     {
-        self.workers.spawn(Self::new_worker(
-            self.synchronizer.clone(),
-            input,
-            output,
-            worker_def,
-        ));
+        let worker = Self::new_worker(input, output, worker_def.clone());
+        self.workers.spawn(worker);
     }
 
     async fn new_worker<I, O, F, Fut>(
-        synchronizer: Arc<Mutex<Synchronizer>>,
         mut input: PipeInput<I>,
         output: Option<PipeOutput<O>>,
         worker_def: F,
     ) where
         I: Send + 'static,
         O: Send + 'static,
-        F: FnMut(I) -> Fut + Clone + Send + 'static,
+        F: FnOnce(I) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = Option<O>> + Send + 'static,
     {
         let mut tasks = JoinSet::new();
 
         while let Some(value) = input.rx.recv().await {
-            let consumed = input.consumed_callback();
             let output = output.clone();
-            let mut work = worker_def.clone();
-
+            let work = worker_def.clone();
             tasks.spawn(async move {
                 if let Some(result) = work(value).await {
                     if let Some(output) = &output {
                         output.submit(result).await;
                     }
                 }
-                consumed();
             });
         }
 
@@ -87,35 +76,20 @@ impl Pipeline {
 
 pub struct PipeInput<T> {
     pipe_id: String,
-    synchronizer: Arc<Mutex<Synchronizer>>,
     rx: Receiver<T>,
 }
 
 impl<T> PipeInput<T> {
-    fn new(
-        pipe_id: impl Into<String>,
-        synchronizer: Arc<Mutex<Synchronizer>>,
-        input_rx: Receiver<T>,
-    ) -> Self {
+    fn new(pipe_id: impl Into<String>, input_rx: Receiver<T>) -> Self {
         Self {
             pipe_id: pipe_id.into(),
-            synchronizer,
             rx: input_rx,
-        }
-    }
-
-    fn consumed_callback(&self) -> impl FnOnce() {
-        let id = self.pipe_id.clone();
-        let sync = self.synchronizer.clone();
-        move || {
-            sync.lock().unwrap().decrement(&id);
         }
     }
 }
 
 pub struct PipeOutput<T> {
     pipe_id: String,
-    synchronizer: Arc<Mutex<Synchronizer>>,
     tx: Sender<T>,
 }
 
@@ -123,38 +97,21 @@ impl<T> Clone for PipeOutput<T> {
     fn clone(&self) -> Self {
         Self {
             pipe_id: self.pipe_id.clone(),
-            synchronizer: self.synchronizer.clone(),
             tx: self.tx.clone(),
         }
     }
 }
 
 impl<T> PipeOutput<T> {
-    fn new(
-        pipe_id: impl Into<String>,
-        synchronizer: Arc<Mutex<Synchronizer>>,
-        output_tx: Sender<T>,
-    ) -> Self {
+    fn new(pipe_id: impl Into<String>, output_tx: Sender<T>) -> Self {
         Self {
             pipe_id: pipe_id.into(),
-            synchronizer,
             tx: output_tx,
         }
     }
 
     pub async fn submit(&self, value: T) {
-        self.synchronizer.lock().unwrap().increment(&self.pipe_id);
         self.send(value).await;
-    }
-
-    pub async fn submit_all(&self, values: Vec<T>) {
-        self.synchronizer
-            .lock()
-            .unwrap()
-            .increment_by(&self.pipe_id, values.len());
-        for value in values {
-            self.send(value).await;
-        }
     }
 
     async fn send(&self, value: T) {
