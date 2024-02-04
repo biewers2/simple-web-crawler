@@ -1,14 +1,18 @@
 use std::collections::HashSet;
 use std::io::Cursor;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_pipes::{BoxedAnySend, Pipeline, PipelineBuilder};
+use async_pipes::{branch, BoxedAnySend, NoOutput, Pipeline, PipelineBuilder, WorkerOptions};
 use html5ever::parse_document;
 use html5ever::tendril::TendrilSink;
 use markup5ever_arcdom::{ArcDom, Handle, NodeData};
 use reqwest::{Client, Response};
 use tokio::sync::Mutex;
+
+const MAX_DEPTH: usize = 10;
 
 enum Pipe {
     Urls,
@@ -28,9 +32,8 @@ impl AsRef<str> for Pipe {
     }
 }
 
-#[tokio::main(worker_threads = 1)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let query = "Google";
+#[tokio::main(worker_threads = 100)]
+async fn main() {
     let init_urls: Vec<(String, usize)> = vec![
         "https://google.com",
         "https://example.com",
@@ -45,87 +48,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map(|s| (s.to_string(), 0))
     .collect();
 
-    let b = Pipeline::builder()
+    let crawled = Arc::new(AtomicUsize::new(0));
+
+    Pipeline::builder()
         .with_inputs(Pipe::Urls, init_urls)
-        .with_flattener::<Vec<(String, usize)>>(Pipe::FoundUrls, Pipe::Urls);
+        .with_flattener::<Vec<(String, usize)>>(Pipe::FoundUrls, Pipe::Urls)
+        .also(register_fetcher(MAX_DEPTH))
+        .also(register_crawler(crawled.clone()))
+        .with_consumer(
+            Pipe::Content,
+            WorkerOptions::default_single_task(),
+            |_content: String| async move {
+                println!("Received content");
+            },
+        )
+        .build()
+        .unwrap()
+        .wait()
+        .await;
 
-    let b = register_fetcher(b, 4);
-    let b = register_crawler(b);
-
-    let b = b.with_consumer(Pipe::Content, |_content: String| async move {
-        println!("Received content");
-    });
-
-    b.build().unwrap().wait().await;
-    Ok(())
+    println!("Crawled over {} websites", crawled.load(Relaxed));
 }
 
-fn register_fetcher(builder: PipelineBuilder, max_depth: usize) -> PipelineBuilder {
+fn register_fetcher(max_depth: usize) -> impl FnOnce(PipelineBuilder) -> PipelineBuilder {
     let client: Client = reqwest::ClientBuilder::new()
         .timeout(Duration::from_secs(10))
+        .user_agent("Rust")
         .build()
         .unwrap();
     let visited = Arc::new(Mutex::new(HashSet::new()));
 
-    builder.with_stage(
-        Pipe::Urls,
-        Pipe::Responses,
-        move |(url, depth): (String, usize)| {
-            let client = client.clone();
-            let visited = visited.clone();
-
-            async move {
-                if depth >= max_depth {
-                    return None;
-                }
-
-                {
-                    let mut visited = visited.lock().await;
-                    if visited.contains(&url) {
-                        println!("{}:\tAlready fetched", &url);
-                        return None;
-                    }
-                    visited.insert(url.clone());
-                }
-
-                println!("Fetching ({}): {}", depth, &url);
-                client.get(&url).send().await.ok().map(|resp| (resp, depth))
-            }
-        },
-    )
+    move |builder| {
+        builder.with_stage(
+            Pipe::Urls,
+            Pipe::Responses,
+            WorkerOptions {
+                pipe_buffer_size: 100000,
+                max_task_count: 1000,
+            },
+            move |(url, depth): (String, usize)| {
+                fetch(url, depth, max_depth, client.clone(), visited.clone())
+            },
+        )
+    }
 }
 
-fn register_crawler(builder: PipelineBuilder) -> PipelineBuilder {
-    builder.with_branching_stage(
-        Pipe::Responses,
-        vec![Pipe::FoundUrls, Pipe::Responses],
-        move |(response, depth): (Response, usize)| async move {
-            let response = match response.error_for_status() {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("Response error: {}", e);
-                    return None;
-                }
-            };
+fn register_crawler(crawled: Arc<AtomicUsize>) -> impl FnOnce(PipelineBuilder) -> PipelineBuilder {
+    move |builder| {
+        builder.with_branching_stage(
+            Pipe::Responses,
+            vec![Pipe::FoundUrls, Pipe::Responses],
+            WorkerOptions {
+                pipe_buffer_size: 10000,
+                max_task_count: 1000,
+            },
+            move |(response, depth): (Response, usize)| crawl(response, depth, crawled.clone()),
+        )
+    }
+}
 
-            let mut body = if let Ok(body) = response.text().await {
-                Cursor::new(body.into_bytes())
-            } else {
-                return None;
-            };
+async fn fetch(
+    url: String,
+    depth: usize,
+    max_depth: usize,
+    client: Client,
+    visited: Arc<Mutex<HashSet<String>>>,
+) -> Option<(Response, usize)> {
+    if depth >= max_depth {
+        return None;
+    }
 
-            let dom = parse_document(ArcDom::default(), Default::default())
-                .from_utf8()
-                .read_from(&mut body)
-                .unwrap();
+    // Drop the lock's guard after using
+    {
+        let mut visited = visited.lock().await;
+        if visited.contains(&url) {
+            return None;
+        }
+        visited.insert(url.clone());
+    }
 
-            let mut urls = Vec::new();
-            visit_node(&dom.document, &mut urls);
-            let urls: Vec<(String, usize)> = urls.into_iter().map(|url| (url, depth + 1)).collect();
+    client.get(&url).send().await.ok().map(|resp| (resp, depth))
+}
 
-            Some(vec![Some(Box::new(urls) as BoxedAnySend), None])
-        },
-    )
+async fn crawl(
+    response: Response,
+    depth: usize,
+    crawled: Arc<AtomicUsize>,
+) -> Option<Vec<Option<BoxedAnySend>>> {
+    let response = match response.error_for_status() {
+        Ok(res) => {
+            // println!("Received response from {}", res.url());
+            res
+        }
+        Err(e) => {
+            eprintln!("Response error: {}", e);
+            return None;
+        }
+    };
+
+    let mut body = if let Ok(body) = response.text().await {
+        Cursor::new(body.into_bytes())
+    } else {
+        return None;
+    };
+
+    let dom = parse_document(ArcDom::default(), Default::default())
+        .from_utf8()
+        .read_from(&mut body)
+        .unwrap();
+
+    let mut urls = Vec::new();
+    visit_node(&dom.document, &mut urls);
+    let urls: Vec<(String, usize)> = urls.into_iter().map(|url| (url, depth + 1)).collect();
+
+    crawled.fetch_add(1, Relaxed);
+    Some(branch![urls, NoOutput])
 }
 
 fn visit_node(node: &Handle, urls: &mut Vec<String>) {
